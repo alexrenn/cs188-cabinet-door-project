@@ -416,26 +416,34 @@ def collect_trajectory(env, device, mirror_actions=True, max_fr=30):
 
 
 def _check_display():
-    """Exit early with helpful instructions if no X display is available."""
+    if sys.platform == "darwin":
+        return
     display = os.environ.get("DISPLAY", "")
-    wayland = os.environ.get("WAYLAND_DISPLAY", "")
 
-    if wayland:
-        # WSLg is running. It provides XWayland at :0, which both pynput
-        # (X11-based) and MuJoCo's GLFW viewer need.
-        if not display or not display.startswith(":"):
-            os.environ["DISPLAY"] = ":0"
-        # Force Mesa software rendering (llvmpipe) for the GLFW window.
-        # WSLg's Mesa D3D12 GPU path often fails with gladLoadGL; llvmpipe
-        # is slower but reliably provides OpenGL 4.5 for the viewer.
-        os.environ.setdefault("GALLIUM_DRIVER", "llvmpipe")
-        os.environ.setdefault("MESA_GL_VERSION_OVERRIDE", "4.5")
-        return
+    # added the above and commented the following section out. Original code caused the following error
+    #ERROR: This script requires a display (X server) for the MuJoCo viewer and keyboard input. No display environment variable is set.
 
-    if display:
-        # Some X display is claimed — let MuJoCo's own error handling deal
-        # with actual render failures.
-        return
+    
+    # """Exit early with helpful instructions if no X display is available."""
+    # display = os.environ.get("DISPLAY", "")
+    # wayland = os.environ.get("WAYLAND_DISPLAY", "")
+
+    # if wayland:
+    #     # WSLg is running. It provides XWayland at :0, which both pynput
+    #     # (X11-based) and MuJoCo's GLFW viewer need.
+    #     if not display or not display.startswith(":"):
+    #         os.environ["DISPLAY"] = ":0"
+    #     # Force Mesa software rendering (llvmpipe) for the GLFW window.
+    #     # WSLg's Mesa D3D12 GPU path often fails with gladLoadGL; llvmpipe
+    #     # is slower but reliably provides OpenGL 4.5 for the viewer.
+    #     os.environ.setdefault("GALLIUM_DRIVER", "llvmpipe")
+    #     os.environ.setdefault("MESA_GL_VERSION_OVERRIDE", "4.5")
+    #     return
+
+    # if display:
+    #     # Some X display is claimed — let MuJoCo's own error handling deal
+    #     # with actual render failures.
+    #     return
 
     # Nothing set at all.
     print("ERROR: This script requires a display (X server) for the MuJoCo viewer")
