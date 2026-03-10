@@ -19,12 +19,15 @@ Usage:
 
 For evaluating official Diffusion Policy / pi-0 / GR00T checkpoints,
 use the evaluation scripts from those repos instead (see 06_train_policy.py).
+
+# NEW CHANGES - Action Chunking: The policy now outputs K actions at once, which are buffered and executed
 """
 
 import argparse
 import os
 import sys
 import time
+from collections import deque
 
 # Force osmesa (CPU offscreen renderer) on Linux/WSL2 -- EGL requires
 # /dev/dri device access that is unavailable in WSL environments.
@@ -53,9 +56,11 @@ def load_policy(checkpoint_path, device):
 
     state_dim = checkpoint["state_dim"]
     action_dim = checkpoint["action_dim"]
+    chunk_size = checkpoint.get("chunk_size", 1)
+    output_dim = chunk_size * action_dim
 
     class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
+        def __init__(self, state_dim, output_dim, hidden_dim=256):
             super().__init__()
             self.net = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
@@ -64,22 +69,22 @@ def load_policy(checkpoint_path, device):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
+                nn.Linear(hidden_dim, output_dim),
                 nn.Tanh(),
             )
 
         def forward(self, state):
             return self.net(state)
 
-    model = SimplePolicy(state_dim, action_dim).to(device)
+    model = SimplePolicy(state_dim, output_dim).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     print(f"Loaded policy from: {checkpoint_path}")
     print(f"  Trained for {checkpoint['epoch']} epochs, loss={checkpoint['loss']:.6f}")
-    print(f"  State dim: {state_dim}, Action dim: {action_dim}")
+    print(f"  State dim: {state_dim}, Action dim: {action_dim}, Chunk size: {chunk_size}")
 
-    return model, state_dim, action_dim
+    return model, state_dim, action_dim, chunk_size
 
 
 def extract_state(obs, state_dim):
@@ -115,6 +120,7 @@ def run_evaluation(
     model,
     state_dim,
     action_dim,
+    chunk_size,
     num_rollouts,
     max_steps,
     split,
@@ -154,13 +160,23 @@ def run_evaluation(
 
         ep_reward = 0.0
         success = False
+        action_buffer = deque()  # FIFO buffer for action chunking
 
         for step in range(max_steps):
-            # Extract state and predict action
-            state = extract_state(obs, state_dim)
-            with torch.no_grad():
-                state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
-                action = model(state_tensor).cpu().numpy().squeeze(0)
+            # If the action buffer is empty, run the policy to get K actions
+            if len(action_buffer) == 0:
+                state = extract_state(obs, state_dim)
+                with torch.no_grad():
+                    state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
+                    raw_output = model(state_tensor).cpu().numpy().squeeze(0)
+
+                # Split output into K individual actions and push to buffer
+                action_chunk = raw_output.reshape(chunk_size, action_dim)
+                for a in action_chunk:
+                    action_buffer.append(a)
+
+            # Pop the next action from the buffer
+            action = action_buffer.popleft()
 
             # Pad action to match environment action dim if needed
             env_action_dim = env.action_dim
@@ -244,7 +260,7 @@ def main():
     print(f"Device: {device}")
 
     # Load the trained policy
-    model, state_dim, action_dim = load_policy(args.checkpoint, device)
+    model, state_dim, action_dim, chunk_size = load_policy(args.checkpoint, device)
 
     # Run evaluation
     print_section(f"Evaluating on {args.split} split ({args.num_rollouts} episodes)")
@@ -253,6 +269,7 @@ def main():
         model=model,
         state_dim=state_dim,
         action_dim=action_dim,
+        chunk_size=chunk_size,
         num_rollouts=args.num_rollouts,
         max_steps=args.max_steps,
         split=args.split,

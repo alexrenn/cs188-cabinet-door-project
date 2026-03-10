@@ -16,6 +16,12 @@ the data loading -> training -> checkpoint pipeline.
 Usage:
     python 06_train_policy.py [--epochs 50] [--batch_size 32] [--lr 1e-4]
     python 06_train_policy.py --use_diffusion_policy   # Use official repo
+
+    # NEW CHANGES - Action chunking: predict K future actions per step (smoother behavior)
+    python 06_train_policy.py --chunk_size 8
+    python 06_train_policy.py --sweep_chunk_sizes 4 8 16
+
+
 """
 
 import argparse
@@ -50,12 +56,17 @@ def get_dataset_path():
     return path
 
 
-def train_simple_policy(config):
+def train_simple_policy(config, chunk_size=1):
     """
     Train a simple behavior-cloning policy.
 
     This is a simplified training loop to illustrate the pipeline.
     For real results, use the official Diffusion Policy codebase.
+
+    Args:
+        config: Training configuration dict.
+        chunk_size: Number of future actions to predict per step (action chunking).
+            K=1 is standard single-step BC; K>1 enables temporal action chunking.
     """
     try:
         import torch
@@ -67,6 +78,8 @@ def train_simple_policy(config):
         sys.exit(1)
 
     print_section("Simple Behavior Cloning Policy")
+    if chunk_size > 1:
+        print(f"Action chunking enabled: K={chunk_size}")
 
     dataset_path = get_dataset_path()
     print(f"Dataset: {dataset_path}")
@@ -85,9 +98,10 @@ def train_simple_policy(config):
         Full visuomotor training with images requires the Diffusion Policy repo.
         """
 
-        def __init__(self, dataset_path, max_episodes=None):
+        def __init__(self, dataset_path, max_episodes=None, chunk_size=1):
             import pyarrow.parquet as pq
 
+            self.chunk_size = chunk_size
             self.states = []
             self.actions = []
 
@@ -113,6 +127,10 @@ def train_simple_policy(config):
             if not parquet_files:
                 raise FileNotFoundError(f"No parquet files found in {chunk_dir}")
 
+            # First pass: collect per-episode state-action sequences
+            episode_states = []  # list of lists
+            episode_actions = []  # list of lists
+
             episodes_loaded = 0
             for pf in parquet_files:
                 table = pq.read_table(os.path.join(chunk_dir, pf))
@@ -137,52 +155,109 @@ def train_simple_policy(config):
                     action_cols = [c for c in df.columns if "action" in c]
 
                 if state_cols and action_cols:
-                    for _, row in df.iterrows():
-                        # Values may be numpy arrays (object columns) or scalars
-                        state_parts = []
-                        for c in state_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                state_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                state_parts.append(float(val))
-                        action_parts = []
-                        for c in action_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                action_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                action_parts.append(float(val))
+                    # Detect episode boundaries via episode_index column
+                    ep_col = None
+                    for candidate in ("episode_index", "episode", "episode_id"):
+                        if candidate in df.columns:
+                            ep_col = candidate
+                            break
 
-                        if state_parts and action_parts:
-                            self.states.append(np.array(state_parts, dtype=np.float32))
-                            self.actions.append(np.array(action_parts, dtype=np.float32))
+                    if ep_col is not None:
+                        groups = df.groupby(ep_col)
+                    else:
+                        # Treat the entire file as one episode
+                        groups = [(0, df)]
 
-                episodes_loaded += 1
+                    for _ep_id, ep_df in groups:
+                        ep_s, ep_a = [], []
+                        for _, row in ep_df.iterrows():
+                            state_parts = []
+                            for c in state_cols:
+                                val = row[c]
+                                if isinstance(val, np.ndarray):
+                                    state_parts.extend(val.flatten().tolist())
+                                elif isinstance(val, (int, float, np.floating)):
+                                    state_parts.append(float(val))
+                            action_parts = []
+                            for c in action_cols:
+                                val = row[c]
+                                if isinstance(val, np.ndarray):
+                                    action_parts.extend(val.flatten().tolist())
+                                elif isinstance(val, (int, float, np.floating)):
+                                    action_parts.append(float(val))
+
+                            if state_parts and action_parts:
+                                ep_s.append(np.array(state_parts, dtype=np.float32))
+                                ep_a.append(np.array(action_parts, dtype=np.float32))
+
+                        if ep_s:
+                            episode_states.append(ep_s)
+                            episode_actions.append(ep_a)
+                            episodes_loaded += 1
+
                 if max_episodes and episodes_loaded >= max_episodes:
                     break
 
-            if len(self.states) == 0:
+            if not episode_states:
                 print("WARNING: Could not extract state-action pairs from parquet files.")
                 print("The dataset may use a different format.")
                 print("Generating synthetic demo data for illustration...")
                 self._generate_synthetic_data()
+            else:
+                # Build (state, action_chunk) pairs respecting episode boundaries
+                K = self.chunk_size
+                for ep_s, ep_a in zip(episode_states, episode_actions):
+                    T = len(ep_s)
+                    for t in range(T):
+                        remaining = T - t
+                        if remaining >= K:
+                            chunk = np.stack(ep_a[t : t + K], axis=0)  # (K, action_dim)
+                        else:
+                            # Pad by repeating the last action
+                            chunk = np.stack(
+                                ep_a[t:] + [ep_a[-1]] * (K - remaining), axis=0
+                            )
+                        self.states.append(ep_s[t])
+                        self.actions.append(chunk.flatten())  # (K * action_dim,)
 
             self.states = np.array(self.states, dtype=np.float32)
             self.actions = np.array(self.actions, dtype=np.float32)
 
-            print(f"Loaded {len(self.states)} state-action pairs")
-            print(f"State dim:  {self.states.shape[-1]}")
-            print(f"Action dim: {self.actions.shape[-1]}")
+            # Infer action_dim per single step
+            if len(episode_actions) > 0 and len(episode_actions[0]) > 0:
+                self.single_action_dim = len(episode_actions[0][0])
+            else:
+                self.single_action_dim = self.actions.shape[-1] // max(K, 1)
+
+            print(f"Loaded {len(self.states)} state-action_chunk pairs")
+            print(f"State dim:       {self.states.shape[-1]}")
+            print(f"Action dim:      {self.single_action_dim}")
+            print(f"Chunk size (K):  {K}")
+            print(f"Output dim:      {self.actions.shape[-1]}")
 
         def _generate_synthetic_data(self):
             """Generate synthetic data for demonstration purposes."""
+            K = self.chunk_size
             rng = np.random.default_rng(42)
-            for _ in range(1000):
-                state = rng.standard_normal(16).astype(np.float32)
-                action = rng.standard_normal(12).astype(np.float32) * 0.1
-                self.states.append(state)
-                self.actions.append(action)
+            self.single_action_dim = 12
+            # Generate synthetic episodes of length 50
+            for _ep in range(20):
+                ep_actions = [
+                    rng.standard_normal(12).astype(np.float32) * 0.1
+                    for _ in range(50)
+                ]
+                for t in range(50):
+                    state = rng.standard_normal(16).astype(np.float32)
+                    remaining = 50 - t
+                    if remaining >= K:
+                        chunk = np.stack(ep_actions[t : t + K], axis=0)
+                    else:
+                        chunk = np.stack(
+                            ep_actions[t:] + [ep_actions[-1]] * (K - remaining),
+                            axis=0,
+                        )
+                    self.states.append(state)
+                    self.actions.append(chunk.flatten())
 
         def __len__(self):
             return len(self.states)
@@ -193,7 +268,7 @@ def train_simple_policy(config):
                 torch.from_numpy(self.actions[idx]),
             )
 
-    dataset = CabinetDemoDataset(dataset_path, max_episodes=50)
+    dataset = CabinetDemoDataset(dataset_path, max_episodes=50, chunk_size=chunk_size)
     dataloader = DataLoader(
         dataset,
         batch_size=config["batch_size"],
@@ -205,10 +280,11 @@ def train_simple_policy(config):
     # 2. Define a simple MLP policy
     # ----------------------------------------------------------------
     state_dim = dataset.states.shape[-1]
-    action_dim = dataset.actions.shape[-1]
+    action_dim = dataset.single_action_dim  # per-step action dim
+    output_dim = chunk_size * action_dim     # total output width
 
     class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
+        def __init__(self, state_dim, output_dim, hidden_dim=256):
             super().__init__()
             self.net = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
@@ -217,7 +293,7 @@ def train_simple_policy(config):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
+                nn.Linear(hidden_dim, output_dim),
                 nn.Tanh(),
             )
 
@@ -227,7 +303,7 @@ def train_simple_policy(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
 
-    model = SimplePolicy(state_dim, action_dim).to(device)
+    model = SimplePolicy(state_dim, output_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
 
     # ----------------------------------------------------------------
@@ -253,7 +329,7 @@ def train_simple_policy(config):
             states_batch = states_batch.to(device)
             actions_batch = actions_batch.to(device)
 
-            pred_actions = model(states_batch)
+            pred_actions = model(states_batch)  # (B, K * action_dim)
             loss = nn.functional.mse_loss(pred_actions, actions_batch)
 
             optimizer.zero_grad()
@@ -279,6 +355,7 @@ def train_simple_policy(config):
                     "loss": best_loss,
                     "state_dim": state_dim,
                     "action_dim": action_dim,
+                    "chunk_size": chunk_size,
                 },
                 ckpt_path,
             )
@@ -293,6 +370,7 @@ def train_simple_policy(config):
             "loss": avg_loss,
             "state_dim": state_dim,
             "action_dim": action_dim,
+            "chunk_size": chunk_size,
         },
         final_path,
     )
@@ -377,6 +455,19 @@ def main():
         help="Path to YAML config file (overrides other args)",
     )
     parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=1,
+        help="Action chunk size K: predict K future actions per step (1=single-step BC)",
+    )
+    parser.add_argument(
+        "--sweep_chunk_sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Sweep over multiple chunk sizes, e.g. --sweep_chunk_sizes 4 8 16",
+    )
+    parser.add_argument(
         "--use_diffusion_policy",
         action="store_true",
         help="Print instructions for using the official Diffusion Policy repo",
@@ -402,7 +493,24 @@ def main():
             "checkpoint_dir": args.checkpoint_dir,
         }
 
-    train_simple_policy(config)
+    # CLI --chunk_size / --sweep_chunk_sizes override config file value
+    if args.sweep_chunk_sizes:
+        chunk_sizes = args.sweep_chunk_sizes
+    elif args.chunk_size != 1:
+        chunk_sizes = [args.chunk_size]
+    else:
+        chunk_sizes = [config.get("chunk_size", args.chunk_size)]
+    for K in chunk_sizes:
+        if len(chunk_sizes) > 1:
+            print_section(f"Sweep: chunk_size K={K}")
+            # Use a subdirectory per chunk size
+            sweep_config = dict(config)
+            sweep_config["checkpoint_dir"] = os.path.join(
+                config["checkpoint_dir"], f"chunk_K{K}"
+            )
+        else:
+            sweep_config = config
+        train_simple_policy(sweep_config, chunk_size=K)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,13 @@ epochs: 100
 batch_size: 64
 learning_rate: 0.0001
 
+# Action chunking: predict K future actions per step
+# K=1 is standard single-step BC; K>1 enables temporal action chunking
+# for smoother, more temporally coherent behavior.
+# Recommended sweep: 4, 8, 16
+# Read chunk_size from config YAML when using --config
+chunk_size: 1
+
 # Checkpoint saving
 checkpoint_dir: /tmp/cabinet_policy_checkpoints
 

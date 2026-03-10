@@ -66,6 +66,7 @@ else:
 
 import argparse
 import time
+from collections import deque
 
 import numpy as np
 import robocasa  # noqa: F401 — registers OpenCabinet environment
@@ -84,9 +85,11 @@ def load_policy(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dim = ckpt["state_dim"]
     action_dim = ckpt["action_dim"]
+    chunk_size = ckpt.get("chunk_size", 1)
+    output_dim = chunk_size * action_dim
 
     class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
+        def __init__(self, state_dim, output_dim, hidden_dim=256):
             super().__init__()
             self.net = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
@@ -95,17 +98,17 @@ def load_policy(checkpoint_path, device):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
+                nn.Linear(hidden_dim, output_dim),
                 nn.Tanh(),
             )
 
         def forward(self, state):
             return self.net(state)
 
-    model = SimplePolicy(state_dim, action_dim).to(device)
+    model = SimplePolicy(state_dim, output_dim).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model, state_dim, action_dim, ckpt
+    return model, state_dim, action_dim, chunk_size, ckpt
 
 
 def extract_state(obs, state_dim):
@@ -127,7 +130,7 @@ def extract_state(obs, state_dim):
 
 # ── On-screen rollout ────────────────────────────────────────────────────────
 
-def run_onscreen(model, state_dim, action_dim, args):
+def run_onscreen(model, state_dim, action_dim, chunk_size, args):
     """
     Run the policy with an interactive MuJoCo viewer window.
 
@@ -161,17 +164,29 @@ def run_onscreen(model, state_dim, action_dim, args):
         print(f"  Task:    {lang}")
         print(f"  Layout:  {env.layout_id}   Style: {env.style_id}")
         print(f"  Running for up to {args.max_steps} steps...")
-        print(f"  (Watch the viewer window — use mouse to orbit the camera)\n")
+        print(f"  (Watch the viewer window — use mouse to orbit the camera)")
+        if chunk_size > 1:
+            print(f"  Action chunking: K={chunk_size} (re-plan every {chunk_size} steps)")
+        print()
 
         success = False
         hold_count = 0
+        action_buffer = deque()  # FIFO buffer for action chunking
 
         for step in range(args.max_steps):
-            state = extract_state(obs, state_dim)
-            with torch.no_grad():
-                action = model(
-                    torch.from_numpy(state).unsqueeze(0).to(device)
-                ).cpu().numpy().squeeze(0)
+            # If the action buffer is empty, run the policy to get K actions
+            if len(action_buffer) == 0:
+                state = extract_state(obs, state_dim)
+                with torch.no_grad():
+                    raw_output = model(
+                        torch.from_numpy(state).unsqueeze(0).to(device)
+                    ).cpu().numpy().squeeze(0)
+
+                action_chunk = raw_output.reshape(chunk_size, action_dim)
+                for a in action_chunk:
+                    action_buffer.append(a)
+
+            action = action_buffer.popleft()
 
             # Pad / trim to environment's expected action dimension
             env_dim = env.action_dim
@@ -214,7 +229,7 @@ def run_onscreen(model, state_dim, action_dim, args):
 
 # ── Off-screen rollout with video ────────────────────────────────────────────
 
-def run_offscreen(model, state_dim, action_dim, args):
+def run_offscreen(model, state_dim, action_dim, chunk_size, args):
     """
     Run the policy headlessly and save a side-by-side annotated video.
 
@@ -255,13 +270,22 @@ def run_offscreen(model, state_dim, action_dim, args):
         success = False
         hold_count = 0
         ep_frames = []
+        action_buffer = deque()  # FIFO buffer for action chunking
 
         for step in range(args.max_steps):
-            state = extract_state(obs, state_dim)
-            with torch.no_grad():
-                action = model(
-                    torch.from_numpy(state).unsqueeze(0).to(device)
-                ).cpu().numpy().squeeze(0)
+            # If the action buffer is empty, run the policy to get K actions
+            if len(action_buffer) == 0:
+                state = extract_state(obs, state_dim)
+                with torch.no_grad():
+                    raw_output = model(
+                        torch.from_numpy(state).unsqueeze(0).to(device)
+                    ).cpu().numpy().squeeze(0)
+
+                action_chunk = raw_output.reshape(chunk_size, action_dim)
+                for a in action_chunk:
+                    action_buffer.append(a)
+
+            action = action_buffer.popleft()
 
             env_dim = env.action_dim
             if len(action) < env_dim:
@@ -383,11 +407,11 @@ def main():
         sys.exit(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, state_dim, action_dim, ckpt = load_policy(args.checkpoint, device)
+    model, state_dim, action_dim, chunk_size, ckpt = load_policy(args.checkpoint, device)
 
     print(f"Checkpoint: {args.checkpoint}")
     print(f"  Epoch {ckpt['epoch']}, loss {ckpt['loss']:.6f}")
-    print(f"  State dim: {state_dim},  Action dim: {action_dim}")
+    print(f"  State dim: {state_dim},  Action dim: {action_dim},  Chunk size: {chunk_size}")
     print(f"  Device: {device}")
     print()
 
@@ -400,11 +424,11 @@ def main():
     print()
 
     if args.offscreen:
-        run_offscreen(model, state_dim, action_dim, args)
+        run_offscreen(model, state_dim, action_dim, chunk_size, args)
     else:
         print("Opening viewer window...")
         print("  Tip: orbit the camera with the mouse to see the gripper.\n")
-        run_onscreen(model, state_dim, action_dim, args)
+        run_onscreen(model, state_dim, action_dim, chunk_size, args)
 
     print("\nDone.")
 
