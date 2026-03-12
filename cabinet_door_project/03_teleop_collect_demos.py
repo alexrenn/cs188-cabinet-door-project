@@ -82,6 +82,19 @@ import robocasa  # noqa: F401 - registers environments including OpenCabinet
 import robosuite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.wrappers import VisualizationWrapper
+from policy_utils import augment_obs_with_handle
+
+# The exact robosuite observation keys that compose the 22-dim
+# observation.state vector. Must match training data layout.
+ROBOSUITE_STATE_KEYS = [
+    "robot0_gripper_qpos",     # 2
+    "robot0_base_pos",         # 3
+    "robot0_base_quat",        # 4
+    "robot0_base_to_eef_pos",  # 3
+    "robot0_base_to_eef_quat", # 4
+    "handle_pos",              # 3
+    "handle_to_eef_pos",       # 3
+]
 
 
 # ── Policy loading (copied from 08_visualize_policy_rollout.py) ──────────
@@ -120,12 +133,12 @@ def load_policy(checkpoint_path, device):
 
 
 def extract_state(obs, state_dim):
-    """Flatten non-image observations into a state vector of length state_dim."""
+    """Extract the fixed-size state vector using the exact keys that
+    match the training data's observation.state layout."""
     parts = []
-    for key in sorted(obs.keys()):
-        val = obs[key]
-        if isinstance(val, np.ndarray) and not key.endswith("_image"):
-            parts.append(val.flatten())
+    for key in ROBOSUITE_STATE_KEYS:
+        if key in obs:
+            parts.append(obs[key].flatten())
     if not parts:
         return np.zeros(state_dim, dtype=np.float32)
     state = np.concatenate(parts).astype(np.float32)
@@ -183,6 +196,7 @@ def collect_dagger_trajectory(
     import torch
 
     obs = env.reset()
+    augment_obs_with_handle(obs, env)
 
     ep_meta = env.get_ep_meta()
     lang = ep_meta.get("lang", None)
@@ -272,6 +286,7 @@ def collect_dagger_trajectory(
 
         # Step the environment
         obs, _, _, _ = env.step(env_action)
+        augment_obs_with_handle(obs, env)
 
         # Record (state, action) — trim action to action_dim for training
         recorded_action = env_action[:action_dim]

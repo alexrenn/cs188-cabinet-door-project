@@ -1,56 +1,27 @@
-# Training configuration for the simple behavior cloning policy
-# For the full Diffusion Policy, use the official repo config instead.
+# Training configuration for the cabinet door policy
+# Works for both --diffusion (DDPM) and default (simple MLP) modes.
 
 # Training parameters
-epochs: 100
-batch_size: 64
+epochs: 1000
+batch_size: 256
 learning_rate: 0.0001
 
 # Action chunking: predict K future actions per step
 # K=1 is standard single-step BC; K>1 enables temporal action chunking
-# for smoother, more temporally coherent behavior.
-# Recommended sweep: 4, 8, 16
-# Read chunk_size from config YAML when using --config
-chunk_size: 1
+chunk_size: 8
 
 # Checkpoint saving
 checkpoint_dir: /tmp/cabinet_policy_checkpoints
 
-# ---------------------------------------------------------------
-# Reference: Official Diffusion Policy config keys
-# (used when training with the robocasa-benchmark/diffusion_policy repo)
-#
-# task: robocasa/OpenCabinet
-# horizon: 16             # prediction horizon (number of future actions)
-# n_obs_steps: 2          # number of observation steps as context
-# n_action_steps: 8       # number of actions to execute per step
-#
-# policy:
-#   type: diffusion_transformer
-#   n_layers: 8
-#   n_heads: 4
-#   d_model: 256
-#   noise_scheduler: ddpm
-#   num_diffusion_iters: 100
-#   num_inference_iters: 16
-#
-# training:
-#   batch_size: 192
-#   lr: 1.0e-4
-#   weight_decay: 1.0e-6
-#   num_epochs: 3000
-#   lr_scheduler: cosine
-#   lr_warmup_steps: 500
-#
-# observation:
-#   image_keys:
-#     - robot0_agentview_left_image
-#     - robot0_agentview_right_image
-#     - robot0_eye_in_hand_image
-#   low_dim_keys:
+# Diffusion-specific (used only with --diffusion flag)
+n_diffusion_steps: 100   # T: number of DDPM noise steps
+hidden_dim: 256           # noise prediction network hidden size
+weight_decay: 0.000001    # AdamW weight decay
 #     - robot0_gripper_qpos
 #     - robot0_base_pos
 #     - robot0_base_quat
 #     - robot0_base_to_eef_pos
 #     - robot0_base_to_eef_quat
+#     - handle_pos
+#     - handle_to_eef_pos
 # ---------------------------------------------------------------

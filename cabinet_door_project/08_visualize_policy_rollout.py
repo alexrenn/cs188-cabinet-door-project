@@ -74,50 +74,42 @@ import robosuite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.wrappers import VisualizationWrapper
 
+from policy_utils import augment_obs_with_handle, load_policy_from_checkpoint
+
+# The exact robosuite observation keys that compose the 22-dim
+# observation.state vector in the training data.
+# Must match the order used during training.
+ROBOSUITE_STATE_KEYS = [
+    "robot0_gripper_qpos",     # 2
+    "robot0_base_pos",         # 3
+    "robot0_base_quat",        # 4
+    "robot0_base_to_eef_pos",  # 3
+    "robot0_base_to_eef_quat", # 4
+    "handle_pos",              # 3
+    "handle_to_eef_pos",       # 3
+]
+
 
 # ── Policy loading (identical to 07_evaluate_policy.py) ─────────────────────
 
 def load_policy(checkpoint_path, device):
-    """Load the SimplePolicy trained by 06_train_policy.py."""
+    """Load a trained policy (supports both simple and diffusion)."""
+    model, state_dim, action_dim, chunk_size = load_policy_from_checkpoint(
+        checkpoint_path, device
+    )
+    # Return the checkpoint dict too for backward compat with callers
     import torch
-    import torch.nn as nn
-
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dim = ckpt["state_dim"]
-    action_dim = ckpt["action_dim"]
-    chunk_size = ckpt.get("chunk_size", 1)
-    output_dim = chunk_size * action_dim
-
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, output_dim, hidden_dim=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, output_dim),
-                nn.Tanh(),
-            )
-
-        def forward(self, state):
-            return self.net(state)
-
-    model = SimplePolicy(state_dim, output_dim).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
     return model, state_dim, action_dim, chunk_size, ckpt
 
 
 def extract_state(obs, state_dim):
-    """Flatten non-image observations into a state vector of length state_dim."""
+    """Extract the fixed-size state vector using the exact keys that
+    match the training data's observation.state layout."""
     parts = []
-    for key in sorted(obs.keys()):
-        val = obs[key]
-        if isinstance(val, np.ndarray) and not key.endswith("_image"):
-            parts.append(val.flatten())
+    for key in ROBOSUITE_STATE_KEYS:
+        if key in obs:
+            parts.append(obs[key].flatten())
     if not parts:
         return np.zeros(state_dim, dtype=np.float32)
     state = np.concatenate(parts).astype(np.float32)
@@ -159,6 +151,7 @@ def run_onscreen(model, state_dim, action_dim, chunk_size, args):
     for ep in range(args.num_episodes):
         print(f"\n--- Episode {ep + 1}/{args.num_episodes} ---")
         obs = env.reset()
+        augment_obs_with_handle(obs, env)
         ep_meta = env.get_ep_meta()
         lang = ep_meta.get("lang", "")
         print(f"  Task:    {lang}")
@@ -196,6 +189,7 @@ def run_onscreen(model, state_dim, action_dim, chunk_size, args):
                 action = action[:env_dim]
 
             obs, reward, done, info = env.step(action)
+            augment_obs_with_handle(obs, env)
 
             # Print a brief status every 20 steps
             if step % 20 == 0:
@@ -262,6 +256,7 @@ def run_offscreen(model, state_dim, action_dim, chunk_size, args):
             camera_heights=cam_h,
         )
         obs = env.reset()
+        augment_obs_with_handle(obs, env)
         ep_meta = env.get_ep_meta()
         lang = ep_meta.get("lang", "")
         print(f"  Task:    {lang}")
@@ -294,6 +289,7 @@ def run_offscreen(model, state_dim, action_dim, chunk_size, args):
                 action = action[:env_dim]
 
             obs, reward, done, info = env.step(action)
+            augment_obs_with_handle(obs, env)
 
             # Render from the agent view camera
             frame = env.sim.render(

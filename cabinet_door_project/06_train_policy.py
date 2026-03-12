@@ -31,6 +31,20 @@ import yaml
 
 import numpy as np
 
+# The exact robosuite observation keys that compose the 22-dim
+# observation.state vector in the training data.
+# Order matters: gripper_qpos(2) + base_pos(3) + base_quat(4)
+#   + eef_pos(3) + eef_quat(4) + handle_pos(3) + handle_to_eef_pos(3) = 22 dims.
+ROBOSUITE_STATE_KEYS = [
+    "robot0_gripper_qpos",     # 2
+    "robot0_base_pos",         # 3
+    "robot0_base_quat",        # 4
+    "robot0_base_to_eef_pos",  # 3
+    "robot0_base_to_eef_quat", # 4
+    "handle_pos",              # 3
+    "handle_to_eef_pos",       # 3
+]
+
 
 def print_section(title):
     print(f"\n{'=' * 60}")
@@ -56,7 +70,7 @@ def get_dataset_path():
     return path
 
 
-def train_simple_policy(config, chunk_size=1):
+def train_simple_policy(config, chunk_size=1, dataset_path=None):
     """
     Train a simple behavior-cloning policy.
 
@@ -67,6 +81,7 @@ def train_simple_policy(config, chunk_size=1):
         config: Training configuration dict.
         chunk_size: Number of future actions to predict per step (action chunking).
             K=1 is standard single-step BC; K>1 enables temporal action chunking.
+        dataset_path: Override path to the dataset directory.
     """
     try:
         import torch
@@ -81,7 +96,8 @@ def train_simple_policy(config, chunk_size=1):
     if chunk_size > 1:
         print(f"Action chunking enabled: K={chunk_size}")
 
-    dataset_path = get_dataset_path()
+    if dataset_path is None:
+        dataset_path = get_dataset_path()
     print(f"Dataset: {dataset_path}")
 
     # ----------------------------------------------------------------
@@ -247,7 +263,7 @@ def train_simple_policy(config, chunk_size=1):
                     for _ in range(50)
                 ]
                 for t in range(50):
-                    state = rng.standard_normal(16).astype(np.float32)
+                    state = rng.standard_normal(22).astype(np.float32)
                     remaining = 50 - t
                     if remaining >= K:
                         chunk = np.stack(ep_actions[t : t + K], axis=0)
@@ -356,6 +372,8 @@ def train_simple_policy(config, chunk_size=1):
                     "state_dim": state_dim,
                     "action_dim": action_dim,
                     "chunk_size": chunk_size,
+                    "policy_type": "simple",
+                    "state_keys": ROBOSUITE_STATE_KEYS,
                 },
                 ckpt_path,
             )
@@ -371,6 +389,8 @@ def train_simple_policy(config, chunk_size=1):
             "state_dim": state_dim,
             "action_dim": action_dim,
             "chunk_size": chunk_size,
+            "policy_type": "simple",
+            "state_keys": ROBOSUITE_STATE_KEYS,
         },
         final_path,
     )
@@ -380,22 +400,298 @@ def train_simple_policy(config, chunk_size=1):
     print(f"Best checkpoint:  {ckpt_path}")
     print(f"Final checkpoint: {final_path}")
 
-    print_section("Next Steps")
-    print(
-        "This simple MLP policy is for educational purposes only.\n"
-        "For a policy that can actually solve the task, use the\n"
-        "official Diffusion Policy codebase:\n"
-        "\n"
-        "  git clone https://github.com/robocasa-benchmark/diffusion_policy\n"
-        "  cd diffusion_policy && pip install -e .\n"
-        "  python train.py \\\n"
-        "    --config-name=train_diffusion_transformer_bs192 \\\n"
-        "    task=robocasa/OpenCabinet\n"
-        "\n"
-        "Alternatively, try pi-0 or GR00T N1.5:\n"
-        "  https://github.com/robocasa-benchmark/openpi\n"
-        "  https://github.com/robocasa-benchmark/Isaac-GR00T"
+
+def train_diffusion_policy(config, chunk_size=1, dataset_path=None):
+    """
+    Train a DDPM-based Diffusion Policy for behavior cloning.
+
+    Uses a noise-prediction network conditioned on state + diffusion
+    timestep.  The model learns to denoise action sequences, and at
+    inference time generates actions via iterative DDPM reverse sampling.
+
+    Args:
+        config: Training configuration dict.
+        chunk_size: Number of future actions to predict per step.
+        dataset_path: Override path to the dataset directory.
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, Dataset
+
+    from policy_utils import DiffusionPolicy
+
+    print_section("Diffusion Policy (DDPM)")
+    if chunk_size > 1:
+        print(f"Action chunking enabled: K={chunk_size}")
+
+    if dataset_path is None:
+        dataset_path = get_dataset_path()
+    print(f"Dataset: {dataset_path}")
+
+    # ----------------------------------------------------------------
+    # 1. Build dataset (reuse the same CabinetDemoDataset)
+    # ----------------------------------------------------------------
+    print("\nLoading dataset...")
+
+    class CabinetDemoDataset(Dataset):
+        """Loads state-action pairs from the LeRobot-format dataset."""
+
+        def __init__(self, dataset_path, max_episodes=None, chunk_size=1):
+            import pyarrow.parquet as pq
+
+            self.chunk_size = chunk_size
+            self.states = []
+            self.actions = []
+
+            data_dir = os.path.join(dataset_path, "data")
+            if not os.path.exists(data_dir):
+                data_dir = os.path.join(dataset_path, "lerobot", "data")
+            if not os.path.exists(data_dir):
+                raise FileNotFoundError(
+                    f"Data directory not found under: {dataset_path}"
+                )
+
+            chunk_dir = os.path.join(data_dir, "chunk-000")
+            if not os.path.exists(chunk_dir):
+                raise FileNotFoundError(f"Chunk directory not found: {chunk_dir}")
+
+            parquet_files = sorted(
+                f for f in os.listdir(chunk_dir) if f.endswith(".parquet")
+            )
+            if not parquet_files:
+                raise FileNotFoundError(f"No parquet files in {chunk_dir}")
+
+            episode_states = []
+            episode_actions = []
+            episodes_loaded = 0
+
+            for pf in parquet_files:
+                table = pq.read_table(os.path.join(chunk_dir, pf))
+                df = table.to_pandas()
+
+                state_cols = [
+                    c for c in df.columns if c.startswith("observation.state")
+                ]
+                action_cols = [
+                    c for c in df.columns
+                    if c == "action" or c.startswith("action.")
+                ]
+
+                if not state_cols or not action_cols:
+                    state_cols = [
+                        c for c in df.columns
+                        if "gripper" in c or "base" in c or "eef" in c
+                    ]
+                    action_cols = [c for c in df.columns if "action" in c]
+
+                if state_cols and action_cols:
+                    ep_col = None
+                    for candidate in ("episode_index", "episode", "episode_id"):
+                        if candidate in df.columns:
+                            ep_col = candidate
+                            break
+
+                    if ep_col is not None:
+                        groups = df.groupby(ep_col)
+                    else:
+                        groups = [(0, df)]
+
+                    for _ep_id, ep_df in groups:
+                        ep_s, ep_a = [], []
+                        for _, row in ep_df.iterrows():
+                            state_parts = []
+                            for c in state_cols:
+                                val = row[c]
+                                if isinstance(val, np.ndarray):
+                                    state_parts.extend(val.flatten().tolist())
+                                elif isinstance(val, (int, float, np.floating)):
+                                    state_parts.append(float(val))
+                            action_parts = []
+                            for c in action_cols:
+                                val = row[c]
+                                if isinstance(val, np.ndarray):
+                                    action_parts.extend(val.flatten().tolist())
+                                elif isinstance(val, (int, float, np.floating)):
+                                    action_parts.append(float(val))
+
+                            if state_parts and action_parts:
+                                ep_s.append(np.array(state_parts, dtype=np.float32))
+                                ep_a.append(np.array(action_parts, dtype=np.float32))
+
+                        if ep_s:
+                            episode_states.append(ep_s)
+                            episode_actions.append(ep_a)
+                            episodes_loaded += 1
+
+                if max_episodes and episodes_loaded >= max_episodes:
+                    break
+
+            # Build (state, action_chunk) pairs respecting episode boundaries
+            K = self.chunk_size
+            for ep_s, ep_a in zip(episode_states, episode_actions):
+                T = len(ep_s)
+                for t in range(T):
+                    remaining = T - t
+                    if remaining >= K:
+                        chunk = np.stack(ep_a[t : t + K], axis=0)
+                    else:
+                        chunk = np.stack(
+                            ep_a[t:] + [ep_a[-1]] * (K - remaining), axis=0
+                        )
+                    self.states.append(ep_s[t])
+                    self.actions.append(chunk.flatten())
+
+            self.states = np.array(self.states, dtype=np.float32)
+            self.actions = np.array(self.actions, dtype=np.float32)
+
+            if len(episode_actions) > 0 and len(episode_actions[0]) > 0:
+                self.single_action_dim = len(episode_actions[0][0])
+            else:
+                self.single_action_dim = self.actions.shape[-1] // max(K, 1)
+
+            print(f"Loaded {len(self.states)} state-action_chunk pairs")
+            print(f"State dim:       {self.states.shape[-1]}")
+            print(f"Action dim:      {self.single_action_dim}")
+            print(f"Chunk size (K):  {K}")
+            print(f"Output dim:      {self.actions.shape[-1]}")
+
+        def __len__(self):
+            return len(self.states)
+
+        def __getitem__(self, idx):
+            return (
+                torch.from_numpy(self.states[idx]),
+                torch.from_numpy(self.actions[idx]),
+            )
+
+    dataset = CabinetDemoDataset(dataset_path, max_episodes=50, chunk_size=chunk_size)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        drop_last=True,
     )
+
+    # ----------------------------------------------------------------
+    # 2. Build Diffusion Policy
+    # ----------------------------------------------------------------
+    state_dim = dataset.states.shape[-1]
+    action_dim = dataset.single_action_dim
+    output_dim = chunk_size * action_dim
+
+    n_diffusion_steps = config.get("n_diffusion_steps", 100)
+    hidden_dim = config.get("hidden_dim", 256)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nDevice: {device}")
+
+    model = DiffusionPolicy(
+        state_dim, output_dim,
+        hidden_dim=hidden_dim,
+        n_diffusion_steps=n_diffusion_steps,
+    ).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Diffusion Policy parameters: {total_params:,}")
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config.get("weight_decay", 1e-6),
+    )
+
+    # ----------------------------------------------------------------
+    # 3. Training loop (noise prediction objective)
+    # ----------------------------------------------------------------
+    print_section("Training (Diffusion)")
+    print(f"Epochs:           {config['epochs']}")
+    print(f"Batch size:       {config['batch_size']}")
+    print(f"LR:               {config['learning_rate']}")
+    print(f"Diffusion steps:  {n_diffusion_steps}")
+
+    checkpoint_dir = config.get("checkpoint_dir", "/tmp/cabinet_policy_checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    best_loss = float("inf")
+    avg_loss = float("inf")
+    ckpt_path = os.path.join(checkpoint_dir, "best_policy.pt")
+
+    for epoch in range(config["epochs"]):
+        epoch_loss = 0.0
+        num_batches = 0
+
+        model.train()
+        for states_batch, actions_batch in dataloader:
+            states_batch = states_batch.to(device)
+            actions_batch = actions_batch.to(device)
+            B = states_batch.shape[0]
+
+            # Sample random diffusion timesteps
+            t = torch.randint(0, n_diffusion_steps, (B,), device=device)
+
+            # Forward diffusion: add noise to ground-truth actions
+            noise = torch.randn_like(actions_batch)
+            sqrt_alpha_cumprod = model.sqrt_alphas_cumprod[t].unsqueeze(-1)
+            sqrt_one_minus = model.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1)
+            noisy_actions = sqrt_alpha_cumprod * actions_batch + sqrt_one_minus * noise
+
+            # Predict the noise
+            predicted_noise = model.predict_noise(noisy_actions, states_batch, t)
+            loss = nn.functional.mse_loss(predicted_noise, noise)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = epoch_loss / max(num_batches, 1)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"  Epoch {epoch + 1:4d}/{config['epochs']}  Loss: {avg_loss:.6f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            ckpt_path = os.path.join(checkpoint_dir, "best_policy.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": best_loss,
+                    "state_dim": state_dim,
+                    "action_dim": action_dim,
+                    "chunk_size": chunk_size,
+                    "policy_type": "diffusion",
+                    "n_diffusion_steps": n_diffusion_steps,
+                    "state_keys": ROBOSUITE_STATE_KEYS,
+                },
+                ckpt_path,
+            )
+
+    # Save final checkpoint
+    final_path = os.path.join(checkpoint_dir, "final_policy.pt")
+    torch.save(
+        {
+            "epoch": config["epochs"],
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": avg_loss,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "chunk_size": chunk_size,
+            "policy_type": "diffusion",
+            "n_diffusion_steps": n_diffusion_steps,
+            "state_keys": ROBOSUITE_STATE_KEYS,
+        },
+        final_path,
+    )
+
+    print(f"\nTraining complete!")
+    print(f"Best loss:        {best_loss:.6f}")
+    print(f"Best checkpoint:  {ckpt_path}")
+    print(f"Final checkpoint: {final_path}")
 
 
 def print_diffusion_policy_instructions():
@@ -439,7 +735,7 @@ def print_diffusion_policy_instructions():
 
 def main():
     parser = argparse.ArgumentParser(description="Train a policy for OpenCabinet")
-    parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
+    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
@@ -468,19 +764,21 @@ def main():
         help="Sweep over multiple chunk sizes, e.g. --sweep_chunk_sizes 4 8 16",
     )
     parser.add_argument(
-        "--use_diffusion_policy",
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Override dataset path (e.g. /tmp/cabinet_22dim_dataset)",
+    )
+    parser.add_argument(
+        "--diffusion",
         action="store_true",
-        help="Print instructions for using the official Diffusion Policy repo",
+        help="Train a DDPM Diffusion Policy instead of the simple MLP",
     )
     args = parser.parse_args()
 
     print("=" * 60)
     print("  OpenCabinet - Policy Training")
     print("=" * 60)
-
-    if args.use_diffusion_policy:
-        print_diffusion_policy_instructions()
-        return
 
     # Build config from args or YAML file
     if args.config:
@@ -500,17 +798,20 @@ def main():
         chunk_sizes = [args.chunk_size]
     else:
         chunk_sizes = [config.get("chunk_size", args.chunk_size)]
+
+    # Pick training function
+    train_fn = train_diffusion_policy if args.diffusion else train_simple_policy
+
     for K in chunk_sizes:
         if len(chunk_sizes) > 1:
             print_section(f"Sweep: chunk_size K={K}")
-            # Use a subdirectory per chunk size
             sweep_config = dict(config)
             sweep_config["checkpoint_dir"] = os.path.join(
                 config["checkpoint_dir"], f"chunk_K{K}"
             )
         else:
             sweep_config = config
-        train_simple_policy(sweep_config, chunk_size=K)
+        train_fn(sweep_config, chunk_size=K, dataset_path=args.dataset_path)
 
 
 if __name__ == "__main__":

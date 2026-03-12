@@ -40,6 +40,21 @@ import numpy as np
 import robocasa  # noqa: F401
 from robocasa.utils.env_utils import create_env
 
+from policy_utils import augment_obs_with_handle, load_policy_from_checkpoint
+
+# The exact robosuite observation keys that compose the 22-dim
+# observation.state vector in the training data.
+# Must match the order used during training.
+ROBOSUITE_STATE_KEYS = [
+    "robot0_gripper_qpos",     # 2
+    "robot0_base_pos",         # 3
+    "robot0_base_quat",        # 4
+    "robot0_base_to_eef_pos",  # 3
+    "robot0_base_to_eef_quat", # 4
+    "handle_pos",              # 3
+    "handle_to_eef_pos",       # 3
+]
+
 
 def print_section(title):
     print(f"\n{'=' * 60}")
@@ -48,71 +63,24 @@ def print_section(title):
 
 
 def load_policy(checkpoint_path, device):
-    """Load a trained policy checkpoint."""
-    import torch
-    import torch.nn as nn
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    state_dim = checkpoint["state_dim"]
-    action_dim = checkpoint["action_dim"]
-    chunk_size = checkpoint.get("chunk_size", 1)
-    output_dim = chunk_size * action_dim
-
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, output_dim, hidden_dim=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, output_dim),
-                nn.Tanh(),
-            )
-
-        def forward(self, state):
-            return self.net(state)
-
-    model = SimplePolicy(state_dim, output_dim).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    print(f"Loaded policy from: {checkpoint_path}")
-    print(f"  Trained for {checkpoint['epoch']} epochs, loss={checkpoint['loss']:.6f}")
-    print(f"  State dim: {state_dim}, Action dim: {action_dim}, Chunk size: {chunk_size}")
-
-    return model, state_dim, action_dim, chunk_size
+    """Load a trained policy checkpoint (supports both simple and diffusion)."""
+    return load_policy_from_checkpoint(checkpoint_path, device)
 
 
 def extract_state(obs, state_dim):
-    """Extract a fixed-size state vector from observations."""
-    state_parts = []
-
-    # Gather available state observations in a consistent order
-    state_keys = sorted(
-        k
-        for k in obs.keys()
-        if not k.endswith("_image") and isinstance(obs[k], np.ndarray)
-    )
-
-    for key in state_keys:
-        val = obs[key].flatten()
-        state_parts.append(val)
-
-    if not state_parts:
+    """Extract the fixed-size state vector using the exact keys that
+    match the training data's observation.state layout."""
+    parts = []
+    for key in ROBOSUITE_STATE_KEYS:
+        if key in obs:
+            parts.append(obs[key].flatten())
+    if not parts:
         return np.zeros(state_dim, dtype=np.float32)
-
-    state = np.concatenate(state_parts).astype(np.float32)
-
-    # Pad or truncate to match expected state_dim
+    state = np.concatenate(parts).astype(np.float32)
     if len(state) < state_dim:
         state = np.pad(state, (0, state_dim - len(state)))
     elif len(state) > state_dim:
         state = state[:state_dim]
-
     return state
 
 
@@ -155,6 +123,7 @@ def run_evaluation(
 
     for ep in range(num_rollouts):
         obs = env.reset()
+        augment_obs_with_handle(obs, env)
         ep_meta = env.get_ep_meta()
         lang = ep_meta.get("lang", "")
 
@@ -186,6 +155,7 @@ def run_evaluation(
                 action = action[:env_action_dim]
 
             obs, reward, done, info = env.step(action)
+            augment_obs_with_handle(obs, env)
             ep_reward += reward
 
             if video_writer is not None:
