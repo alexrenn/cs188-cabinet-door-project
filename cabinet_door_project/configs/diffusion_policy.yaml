@@ -2,7 +2,7 @@
 # Works for both --diffusion (DDPM) and default (simple MLP) modes.
 
 # Training parameters
-epochs: 1000
+epochs: 10000
 batch_size: 256
 learning_rate: 0.0001
 

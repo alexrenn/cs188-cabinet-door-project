@@ -94,18 +94,19 @@ ROBOSUITE_STATE_KEYS = [
 
 def load_policy(checkpoint_path, device):
     """Load a trained policy (supports both simple and diffusion)."""
-    model, state_dim, action_dim, chunk_size = load_policy_from_checkpoint(
+    model, state_dim, action_dim, chunk_size, state_mean, state_std = load_policy_from_checkpoint(
         checkpoint_path, device
     )
     # Return the checkpoint dict too for backward compat with callers
     import torch
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    return model, state_dim, action_dim, chunk_size, ckpt
+    return model, state_dim, action_dim, chunk_size, ckpt, state_mean, state_std
 
 
-def extract_state(obs, state_dim):
+def extract_state(obs, state_dim, state_mean=None, state_std=None):
     """Extract the fixed-size state vector using the exact keys that
-    match the training data's observation.state layout."""
+    match the training data's observation.state layout.
+    If state_mean/state_std are provided, normalise to zero-mean unit-variance."""
     parts = []
     for key in ROBOSUITE_STATE_KEYS:
         if key in obs:
@@ -117,12 +118,14 @@ def extract_state(obs, state_dim):
         state = np.pad(state, (0, state_dim - len(state)))
     elif len(state) > state_dim:
         state = state[:state_dim]
+    if state_mean is not None and state_std is not None:
+        state = (state - state_mean) / state_std
     return state
 
 
 # ── On-screen rollout ────────────────────────────────────────────────────────
 
-def run_onscreen(model, state_dim, action_dim, chunk_size, args):
+def run_onscreen(model, state_dim, action_dim, chunk_size, args, state_mean=None, state_std=None):
     """
     Run the policy with an interactive MuJoCo viewer window.
 
@@ -223,7 +226,7 @@ def run_onscreen(model, state_dim, action_dim, chunk_size, args):
 
 # ── Off-screen rollout with video ────────────────────────────────────────────
 
-def run_offscreen(model, state_dim, action_dim, chunk_size, args):
+def run_offscreen(model, state_dim, action_dim, chunk_size, args, state_mean=None, state_std=None):
     """
     Run the policy headlessly and save a side-by-side annotated video.
 
@@ -270,7 +273,7 @@ def run_offscreen(model, state_dim, action_dim, chunk_size, args):
         for step in range(args.max_steps):
             # If the action buffer is empty, run the policy to get K actions
             if len(action_buffer) == 0:
-                state = extract_state(obs, state_dim)
+                state = extract_state(obs, state_dim, state_mean, state_std)
                 with torch.no_grad():
                     raw_output = model(
                         torch.from_numpy(state).unsqueeze(0).to(device)
@@ -403,7 +406,7 @@ def main():
         sys.exit(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, state_dim, action_dim, chunk_size, ckpt = load_policy(args.checkpoint, device)
+    model, state_dim, action_dim, chunk_size, ckpt, state_mean, state_std = load_policy(args.checkpoint, device)
 
     print(f"Checkpoint: {args.checkpoint}")
     print(f"  Epoch {ckpt['epoch']}, loss {ckpt['loss']:.6f}")
@@ -420,11 +423,11 @@ def main():
     print()
 
     if args.offscreen:
-        run_offscreen(model, state_dim, action_dim, chunk_size, args)
+        run_offscreen(model, state_dim, action_dim, chunk_size, args, state_mean, state_std)
     else:
         print("Opening viewer window...")
         print("  Tip: orbit the camera with the mouse to see the gripper.\n")
-        run_onscreen(model, state_dim, action_dim, chunk_size, args)
+        run_onscreen(model, state_dim, action_dim, chunk_size, args, state_mean, state_std)
 
     print("\nDone.")
 

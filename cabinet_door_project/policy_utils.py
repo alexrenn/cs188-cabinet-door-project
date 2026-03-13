@@ -151,7 +151,10 @@ class DiffusionPolicy(nn.Module):
 def load_policy_from_checkpoint(checkpoint_path, device):
     """Load a trained policy (SimplePolicy or DiffusionPolicy) from a checkpoint.
 
-    Returns (model, state_dim, action_dim, chunk_size).
+    Returns (model, state_dim, action_dim, chunk_size, state_mean, state_std).
+    ``state_mean`` and ``state_std`` are numpy arrays for normalising
+    observations at inference time.  If the checkpoint was saved without
+    normalization stats both will be ``None``.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dim = ckpt["state_dim"]
@@ -171,13 +174,21 @@ def load_policy_from_checkpoint(checkpoint_path, device):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
+    # Normalization stats (may be absent in older checkpoints)
+    state_mean = ckpt.get("state_mean", None)
+    state_std = ckpt.get("state_std", None)
+
     epoch = ckpt.get("epoch", "?")
     loss = ckpt.get("loss", float("nan"))
     print(f"Loaded {policy_type} policy from: {checkpoint_path}")
     print(f"  Trained for {epoch} epochs, loss={loss:.6f}")
     print(f"  State dim: {state_dim}, Action dim: {action_dim}, Chunk size: {chunk_size}")
+    if state_mean is not None:
+        print(f"  State normalization: yes")
+    else:
+        print(f"  State normalization: none (legacy checkpoint)")
 
-    return model, state_dim, action_dim, chunk_size
+    return model, state_dim, action_dim, chunk_size, state_mean, state_std
 
 
 def _handle_name_to_body(handle_name):

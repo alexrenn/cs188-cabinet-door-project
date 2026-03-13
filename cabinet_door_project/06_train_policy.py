@@ -285,6 +285,14 @@ def train_simple_policy(config, chunk_size=1, dataset_path=None):
             )
 
     dataset = CabinetDemoDataset(dataset_path, max_episodes=50, chunk_size=chunk_size)
+
+    # ── State normalization (zero-mean, unit-variance) ───────────────
+    state_mean = dataset.states.mean(axis=0)
+    state_std  = dataset.states.std(axis=0)
+    state_std[state_std < 1e-6] = 1.0  # avoid division by zero for constant dims
+    dataset.states = (dataset.states - state_mean) / state_std
+    print(f"State normalization applied (mean subtracted, divided by std)")
+
     dataloader = DataLoader(
         dataset,
         batch_size=config["batch_size"],
@@ -374,6 +382,8 @@ def train_simple_policy(config, chunk_size=1, dataset_path=None):
                     "chunk_size": chunk_size,
                     "policy_type": "simple",
                     "state_keys": ROBOSUITE_STATE_KEYS,
+                    "state_mean": state_mean,
+                    "state_std": state_std,
                 },
                 ckpt_path,
             )
@@ -391,6 +401,8 @@ def train_simple_policy(config, chunk_size=1, dataset_path=None):
             "chunk_size": chunk_size,
             "policy_type": "simple",
             "state_keys": ROBOSUITE_STATE_KEYS,
+            "state_mean": state_mean,
+            "state_std": state_std,
         },
         final_path,
     )
@@ -565,6 +577,14 @@ def train_diffusion_policy(config, chunk_size=1, dataset_path=None):
             )
 
     dataset = CabinetDemoDataset(dataset_path, max_episodes=50, chunk_size=chunk_size)
+
+    # ── State normalization (zero-mean, unit-variance) ───────────────
+    state_mean = dataset.states.mean(axis=0)
+    state_std  = dataset.states.std(axis=0)
+    state_std[state_std < 1e-6] = 1.0  # avoid division by zero for constant dims
+    dataset.states = (dataset.states - state_mean) / state_std
+    print(f"State normalization applied (mean subtracted, divided by std)")
+
     dataloader = DataLoader(
         dataset,
         batch_size=config["batch_size"],
@@ -666,6 +686,8 @@ def train_diffusion_policy(config, chunk_size=1, dataset_path=None):
                     "policy_type": "diffusion",
                     "n_diffusion_steps": n_diffusion_steps,
                     "state_keys": ROBOSUITE_STATE_KEYS,
+                    "state_mean": state_mean,
+                    "state_std": state_std,
                 },
                 ckpt_path,
             )
@@ -684,6 +706,8 @@ def train_diffusion_policy(config, chunk_size=1, dataset_path=None):
             "policy_type": "diffusion",
             "n_diffusion_steps": n_diffusion_steps,
             "state_keys": ROBOSUITE_STATE_KEYS,
+            "state_mean": state_mean,
+            "state_std": state_std,
         },
         final_path,
     )

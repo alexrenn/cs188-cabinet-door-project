@@ -67,9 +67,10 @@ def load_policy(checkpoint_path, device):
     return load_policy_from_checkpoint(checkpoint_path, device)
 
 
-def extract_state(obs, state_dim):
+def extract_state(obs, state_dim, state_mean=None, state_std=None):
     """Extract the fixed-size state vector using the exact keys that
-    match the training data's observation.state layout."""
+    match the training data's observation.state layout.
+    If state_mean/state_std are provided, normalise to zero-mean unit-variance."""
     parts = []
     for key in ROBOSUITE_STATE_KEYS:
         if key in obs:
@@ -81,6 +82,8 @@ def extract_state(obs, state_dim):
         state = np.pad(state, (0, state_dim - len(state)))
     elif len(state) > state_dim:
         state = state[:state_dim]
+    if state_mean is not None and state_std is not None:
+        state = (state - state_mean) / state_std
     return state
 
 
@@ -94,6 +97,8 @@ def run_evaluation(
     split,
     video_path,
     seed,
+    state_mean=None,
+    state_std=None,
 ):
     """Run evaluation rollouts and collect statistics."""
     import torch
@@ -134,7 +139,7 @@ def run_evaluation(
         for step in range(max_steps):
             # If the action buffer is empty, run the policy to get K actions
             if len(action_buffer) == 0:
-                state = extract_state(obs, state_dim)
+                state = extract_state(obs, state_dim, state_mean, state_std)
                 with torch.no_grad():
                     state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
                     raw_output = model(state_tensor).cpu().numpy().squeeze(0)
@@ -230,7 +235,7 @@ def main():
     print(f"Device: {device}")
 
     # Load the trained policy
-    model, state_dim, action_dim, chunk_size = load_policy(args.checkpoint, device)
+    model, state_dim, action_dim, chunk_size, state_mean, state_std = load_policy(args.checkpoint, device)
 
     # Run evaluation
     print_section(f"Evaluating on {args.split} split ({args.num_rollouts} episodes)")
@@ -245,6 +250,8 @@ def main():
         split=args.split,
         video_path=args.video_path,
         seed=args.seed,
+        state_mean=state_mean,
+        state_std=state_std,
     )
 
     # Print summary
