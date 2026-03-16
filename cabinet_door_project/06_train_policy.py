@@ -30,7 +30,6 @@ import sys
 import yaml
 
 import numpy as np
-from policy_utils import canonicalize_quat
 
 # The exact robosuite observation keys that compose the 22-dim
 # observation.state vector in the training data.
@@ -286,12 +285,6 @@ def train_simple_policy(config, chunk_size=1, dataset_path=None):
             )
 
     dataset = CabinetDemoDataset(dataset_path, max_episodes=50, chunk_size=chunk_size)
-
-    # ── Canonicalize quaternions (q and -q are the same rotation) ────
-    for i in range(len(dataset.states)):
-        dataset.states[i, 5:9]   = canonicalize_quat(dataset.states[i, 5:9])
-        dataset.states[i, 12:16] = canonicalize_quat(dataset.states[i, 12:16])
-    print("Quaternion signs canonicalized (base_quat, eef_quat)")
 
     # ── State normalization (zero-mean, unit-variance) ───────────────
     state_mean = dataset.states.mean(axis=0)
@@ -584,12 +577,6 @@ def train_diffusion_policy(config, chunk_size=1, dataset_path=None):
             )
 
     dataset = CabinetDemoDataset(dataset_path, max_episodes=50, chunk_size=chunk_size)
-
-    # ── Canonicalize quaternions (q and -q are the same rotation) ────
-    for i in range(len(dataset.states)):
-        dataset.states[i, 5:9]   = canonicalize_quat(dataset.states[i, 5:9])
-        dataset.states[i, 12:16] = canonicalize_quat(dataset.states[i, 12:16])
-    print("Quaternion signs canonicalized (base_quat, eef_quat)")
 
     # ── State normalization (zero-mean, unit-variance) ───────────────
     state_mean = dataset.states.mean(axis=0)
